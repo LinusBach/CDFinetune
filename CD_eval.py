@@ -1,16 +1,15 @@
 
 import argparse
+import os
+
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import pandas as pd
 from tqdm import tqdm
 import re
-from torch.utils.data import DataLoader
 import pandas as pd
-from datasets import load_dataset
 import matplotlib.pyplot as plt
-import seaborn as sns
+
 
 DATASET_ID = "Rykeryuhang/CDEval"
 cultural_dimensions = {
@@ -156,10 +155,9 @@ def evaluate_model(model_id="google/gemma-3-1b-it", batch_size=128, out_file=Non
     # -----------------------------------------------------------------------------
     df = pd.DataFrame(results)
     if out_file is None:
-        out_file = model_id.split("/")[-1]
-    out_path = f"out_file{"_rev" if flip else ""}.csv"
-    df.to_csv(out_path, index=False)
-    print(f"\nSaved to {out_path}")
+        out_file = model_id.split("/")[-1]+f"{"_rev" if flip else ""}.csv"
+    df.to_csv(out_file, index=False)
+    print(f"\nSaved to {out_file}")
 
     if not df.empty:
         print("-" * 40)
@@ -169,7 +167,7 @@ def evaluate_model(model_id="google/gemma-3-1b-it", batch_size=128, out_file=Non
 
 # @title Analyze responses
 
-def analyze_responses(responses_orig='gemma3_1b_cdeval.csv', responses_rev='gemma3_1b_cdeval_rev.csv', plot=False):
+def analyze_responses(responses_orig, responses_rev, save_analysis=None, plot=False):
     # Load the original predictions dataframe
     df_orig = pd.read_csv(responses_orig)
 
@@ -247,7 +245,12 @@ def analyze_responses(responses_orig='gemma3_1b_cdeval.csv', responses_rev='gemm
     print("Cultural Leaning by Dimension (Percentages):")
     print(df_leaning[['dimension', 'option1_name', 'percentage_option1', 'option2_name', 'percentage_option2']])
 
-    print("\nPoisitional Consistency (same choice after reversing):")
+    if save_analysis:
+        analysis_out_file = responses_orig[:-4] + "_analysis.csv"
+        df_leaning.to_csv(analysis_out_file, index=False)
+        print(f"\nAnalysis saved to {analysis_out_file}")
+
+    print("\nPositional Consistency (same choice after reversing):")
     print((df_combined['lean_option1_score'] != df_combined['lean_option2_score']).value_counts(normalize=True))
 
     if not plot:
@@ -288,12 +291,18 @@ def analyze_responses(responses_orig='gemma3_1b_cdeval.csv', responses_rev='gemm
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Evaluate and analyze cultural alignment of language models.")
-    parser.add_argument("--model_id", type=str, required=True, help="HuggingFace model ID to evaluate.")
+    parser.add_argument("--model_id", type=str, default="google/gemma-3-1b-it", help="HuggingFace model ID to evaluate.")
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for model inference.")
+    parser.add_argument("--output_dir", type=str, default="results", help="Output directory for results.")
+    parser.add_argument("--dataset_id", type=str, default=DATASET_ID, help="Dataset ID for evaluation.")
     args = parser.parse_args()
 
-    out_name = args.model_id.split('/')[0]
-    evaluate_model(args.model_id, args.batch_size, out_file=out_name+".csv", flip=False)
-    evaluate_model(args.model_id, args.batch_size, out_file=out_name+"_rev.csv", flip=True)
+    out_name = args.model_id.split('/')[-1]
+    out_path = os.path.join(args.output_dir, out_name)
+    evaluate_model(args.model_id, args.batch_size, out_file=out_path+".csv", flip=False)
+    evaluate_model(args.model_id, args.batch_size, out_file=out_path+"_rev.csv", flip=True)
 
-    analyze_responses(out_name+".csv", out_name+"_rev.csv")
+    if not (os.path.isfile(out_path+".csv") and os.path.isfile(out_path+"_rev.csv")):
+        print("One or both of the required output files for analysis are missing. Exiting analysis.")
+    else:
+        analyze_responses(out_path+".csv", out_path+"_rev.csv", save_analysis=True)
