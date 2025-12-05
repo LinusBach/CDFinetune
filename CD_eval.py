@@ -190,7 +190,7 @@ def evaluate_model(model_id="google/gemma-3-1b-it", batch_size=16, num_samples=5
     # -----------------------------------------------------------------------------
     df = pd.DataFrame(results)
     if out_file is None:
-        out_file = model_id.split("/")[-1] + f"{"_rev" if flip else ""}.csv"
+        out_file = model_id.split("/")[-1] + f"{'_rev' if flip else ''}.csv"
     df.to_csv(out_file, index=False)
     print(f"\nSaved to {out_file}")
 
@@ -275,7 +275,9 @@ def analyze_responses(responses_orig, responses_rev, save_analysis=None):
         print(f"\nAnalysis saved to {analysis_out_file}")
 
 
-def plot_cultural_alignment(df_combined):
+def plot_cultural_alignment(path_df_combined, path_out=None):
+
+    df_combined = pd.read_csv(path_df_combined)
 
     plt.figure(figsize=(14, 8))
     sns.set_theme(style="whitegrid")
@@ -285,8 +287,8 @@ def plot_cultural_alignment(df_combined):
         data=df_combined,
         x='dimension',
         y='score_option1',
+        hue='dimension',
         palette="muted",
-        inner="quartile",  # Show quartiles inside the violin
         cut=0  # Don't extend the plot past the data range (0 to 1)
     )
 
@@ -308,12 +310,16 @@ def plot_cultural_alignment(df_combined):
         opt2 = cultural_dimensions[dim]['option 2']
 
         # Label for Option 1 (Top)
-        ax.text(i, 1.02, opt1, ha='center', va='bottom', fontsize=9, color='darkblue', rotation=45)
+        ax.text(i, 1.02, opt1, ha='center', va='bottom', fontsize=9, color='gray')
         # Label for Option 2 (Bottom)
-        ax.text(i, -0.02, opt2, ha='center', va='top', fontsize=9, color='darkred', rotation=45)
+        ax.text(i, -0.02, opt2, ha='center', va='top', fontsize=9, color='gray')
 
     plt.tight_layout()
     plt.show()
+
+    if path_out:
+        plt.savefig(path_out)
+        print(f"Plot saved to {path_out}")
 
 if __name__ == "__main__":
 
@@ -322,6 +328,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for model inference.")
     parser.add_argument("--output_dir", type=str, default="results", help="Output directory for results.")
     parser.add_argument("--dataset_id", type=str, default=DATASET_ID, help="Dataset ID for evaluation.")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for probabilistic decoding.")
+    parser.add_argument("--num_samples", type=int, default=5, help="Number of samples per prompt for voting.")
     args = parser.parse_args()
 
     out_name = args.model_id.split('/')[-1]
