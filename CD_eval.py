@@ -9,7 +9,7 @@ from tqdm import tqdm
 import re
 import pandas as pd
 import matplotlib.pyplot as plt
-
+import seaborn as sns
 
 DATASET_ID = "Rykeryuhang/CDEval"
 cultural_dimensions = {
@@ -39,39 +39,47 @@ cultural_dimensions = {
             "option 2": "Restraint"}
 }
 
+
 # @title Model inference
 
 def extract_answer(response_text, flip=False):
     """Parses 'A' or 'B' from the model output."""
     clean_text = response_text.replace("*", "").replace("[", "").replace("]", "").strip().upper()
     match = re.search(r'\b([AB])\b', clean_text)
+
+    # If no match found, return None
+    if not match:
+        return "UNKNOWN"
+
+    captured = match.group(1)
+
+    # If flip is True: A becomes B, B becomes A
     if flip:
-        return "B" if match and match.group(1) == "A" else "A"
-    return match.group(1) if match else "UNKNOWN"
+        return "B" if captured == "A" else "A"
 
-def evaluate_model(model_id="google/gemma-3-1b-it", batch_size=128, out_file=None, flip=False):
+    return captured
+
+
+def evaluate_model(model_id="google/gemma-3-1b-it", batch_size=16, num_samples=5, temperature=0.7, out_file=None,
+                   flip=False):
     print(f"Loading model: {model_id}...")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        tokenizer.padding_side = "left"
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True
-        )
-    except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
-        return
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True
+    )
 
     print(f"Loading and processing dataset: {DATASET_ID}...")
     dataset = load_dataset(DATASET_ID, split="train")
 
     # 1. Pre-format prompts
-    # We need to apply the chat template to every row first to get the full string strings
     def apply_template(batch):
         prompts = []
         for q, o1, o2 in zip(batch['Question'], batch['Option 1'], batch['Option 2']):
@@ -89,7 +97,6 @@ def evaluate_model(model_id="google/gemma-3-1b-it", batch_size=128, out_file=Non
                     "Which option aligns best with your answer? Reply ONLY with the letter 'A' or 'B'."
                 )
 
-            # apply_chat_template returns a string when tokenize=False
             prompt = tokenizer.apply_chat_template(
                 [{"role": "user", "content": user_msg}],
                 tokenize=False,
@@ -98,25 +105,19 @@ def evaluate_model(model_id="google/gemma-3-1b-it", batch_size=128, out_file=Non
             prompts.append(prompt)
         return {"final_prompt": prompts}
 
-    # Map the dataset to add the 'final_prompt' column
     processed_dataset = dataset.map(apply_template, batched=True)
-
-    # Filter out empty prompts (bad data)
     processed_dataset = processed_dataset.filter(lambda x: x['final_prompt'] != "")
 
     results = []
-
-    # Convert to a list of dicts for easy batching in a custom loop
-    # (Simpler than a Torch CollateFn for text-generation pipelines)
     data_list = processed_dataset.to_list()
 
-    print(f"Starting batched inference on {len(data_list)} items (Batch size: {batch_size})...")
+    print(f"Starting batched inference on {len(data_list)} items.")
+    print(f"Config: Batch Size={batch_size}, Samples per prompt={num_samples}, Temperature={temperature}")
 
     for i in tqdm(range(0, len(data_list), batch_size)):
-        batch_items = data_list[i : i + batch_size]
+        batch_items = data_list[i: i + batch_size]
         batch_prompts = [item['final_prompt'] for item in batch_items]
 
-        # Tokenize the batch
         inputs = tokenizer(
             batch_prompts,
             return_tensors="pt",
@@ -125,29 +126,63 @@ def evaluate_model(model_id="google/gemma-3-1b-it", batch_size=128, out_file=Non
             max_length=2048
         ).to(model.device)
 
+        input_len = inputs.input_ids.shape[1]
+
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=5,
-                do_sample=False,
-                temperature=0.0,
+                do_sample=True,  # Enable sampling
+                temperature=temperature,  # Set temperature
+                num_return_sequences=num_samples,  # Generate N answers per prompt
                 pad_token_id=tokenizer.pad_token_id
             )
 
-        # Batch decode
-        # We slice [input_len:] to get only the generated part
-        input_len = inputs.input_ids.shape[1]
+        # Decode all sequences
+        # Output shape is [batch_size * num_samples, sequence_length]
         generated_tokens = outputs[:, input_len:]
         decoded_responses = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
         # Aggregate results
-        for item, response in zip(batch_items, decoded_responses):
-            pred = extract_answer(response)
+        # We need to stride through the decoded responses
+        for j, item in enumerate(batch_items):
+            # Calculate range for this specific question
+            start_idx = j * num_samples
+            end_idx = start_idx + num_samples
+
+            # Get the N responses for this single question
+            samples = decoded_responses[start_idx: end_idx]
+
+            # Vote Counting
+            votes_a = 0
+            votes_b = 0
+            raw_answers = []
+
+            for sample_response in samples:
+                # Note: extract_answer handles the 'flip' logic for us
+                pred = extract_answer(sample_response, flip=flip)
+                raw_answers.append(pred)
+                if pred == "A":
+                    votes_a += 1
+                elif pred == "B":
+                    votes_b += 1
+
+            # Determine Majority Vote
+            if votes_a > votes_b:
+                final_pred = "A"
+            elif votes_b > votes_a:
+                final_pred = "B"
+            else:
+                final_pred = "UNKNOWN"  # Tie or empty
+
+            # Save stats
             results.append({
                 "question": item['Question'],
                 "dimension": item.get('Dimension', 'N/A'),
-                "prediction": pred,
-                "raw_response": response
+                "prediction": final_pred,  # Majority vote (keeps compatibility with analysis)
+                "score_A": votes_a / num_samples,  # Confidence score
+                "score_B": votes_b / num_samples,
+                "raw_votes": str(raw_answers)  # Store raw list for debugging
             })
 
     # -----------------------------------------------------------------------------
@@ -155,138 +190,130 @@ def evaluate_model(model_id="google/gemma-3-1b-it", batch_size=128, out_file=Non
     # -----------------------------------------------------------------------------
     df = pd.DataFrame(results)
     if out_file is None:
-        out_file = model_id.split("/")[-1]+f"{"_rev" if flip else ""}.csv"
+        out_file = model_id.split("/")[-1] + f"{"_rev" if flip else ""}.csv"
     df.to_csv(out_file, index=False)
     print(f"\nSaved to {out_file}")
 
     if not df.empty:
         print("-" * 40)
-        print("DISTRIBUTION:")
+        print("DISTRIBUTION (Majority Vote):")
         print(df['prediction'].value_counts(normalize=True))
         print("-" * 40)
 
+
 # @title Analyze responses
 
-def analyze_responses(responses_orig, responses_rev, save_analysis=None, plot=False):
-    # Load the original predictions dataframe
+def analyze_responses(responses_orig, responses_rev, save_analysis=None):
+    print("Loading response files...")
+    # Load the predictions dataframes
     df_orig = pd.read_csv(responses_orig)
-
-    # Load the reversed predictions dataframe
     df_rev = pd.read_csv(responses_rev)
 
-    # Rename the prediction columns for clarity
-    df_orig = df_orig.rename(columns={'prediction': 'prediction_orig'})
-    df_rev = df_rev.rename(columns={'prediction': 'prediction_rev'})
-
-    # 1. Load the original dataset to get Option 1 and Option 2
-    dataset = load_dataset(DATASET_ID, split="train")
-    original_df = pd.DataFrame(dataset)
-
-    # 2. Merge df_orig and df_rev
-    df_combined = pd.merge(df_orig, df_rev, on=['question', 'dimension'], how='inner')
-
-    # 3. Merge df_combined with the original dataset to get 'Option 1' and 'Option 2'
-    df_combined = pd.merge(df_combined, original_df[['Question', 'Option 1', 'Option 2']],
-                        left_on='question', right_on='Question', how='inner')
-    df_combined = df_combined.drop(columns=['Question']) # Drop the redundant Question column
-
-    # 4. Create chosen_content_orig
-    df_combined['chosen_content_orig'] = df_combined.apply(
-        lambda row: row['Option 1'] if row['prediction_orig'] == 'A' else row['Option 2'],
-        axis=1
+    # 1. Merge the two runs
+    # We rename columns to keep track of the original vs reversed run
+    df_combined = pd.merge(
+        df_orig[['question', 'dimension', 'score_A', 'score_B']],
+        df_rev[['question', 'dimension', 'score_A', 'score_B']],
+        on=['question', 'dimension'],
+        how='inner',
+        suffixes=('_orig', '_rev')
     )
 
-    # 5. Create chosen_content_rev (Option 2 was presented as 'A' in reversed, Option 1 as 'B')
-    df_combined['chosen_content_rev'] = df_combined.apply(
-        lambda row: row['Option 2'] if row['prediction_rev'] == 'A' else row['Option 1'],
-        axis=1
-    )
+    # 2. Map Scores to Content (Option 1 vs Option 2)
+    # Context:
+    # Original Run: A = Option 1, B = Option 2
+    # Reversed Run: A = Option 2, B = Option 1
 
-    def calculate_content_leaning(row):
-        lean_option1_score = 0.0
-        lean_option2_score = 0.0
+    # Score for Option 1: Average of (Orig A) and (Rev B)
+    df_combined['score_option1'] = (df_combined['score_A_orig'] + df_combined['score_B_rev']) / 2
 
-        # Case 1: Content is consistent across both runs
-        if row['chosen_content_orig'] == row['chosen_content_rev']:
-            if row['chosen_content_orig'] == row['Option 1']:
-                lean_option1_score = 1.0
-            else: # row['chosen_content_orig'] == row['Option 2']
-                lean_option2_score = 1.0
-        # Case 2: Content is NOT consistent (implies positional bias)
-        else:
-            # Original choice was Option 1, reversed choice was Option 2 (Positional A bias)
-            # Or original choice was Option 2, reversed choice was Option 1 (Positional B bias)
-            # In both these cases, model picked a position, not content consistently
-            # So we assign 0.5 to each option's content
-            lean_option1_score = 0.5
-            lean_option2_score = 0.5
+    # Score for Option 2: Average of (Orig B) and (Rev A)
+    df_combined['score_option2'] = (df_combined['score_B_orig'] + df_combined['score_A_rev']) / 2
 
-        return lean_option1_score, lean_option2_score
+    # 3. Calculate Positional Bias (The "Difference" induced by flipping)
+    # If the model is perfectly robust, Score(Option 1 as A) should equal Score(Option 1 as B).
+    # Bias > 0: Model prefers this option MORE when it is in position A.
+    # Bias < 0: Model prefers this option MORE when it is in position B.
+    # We take the absolute difference to measure general "instability".
+    df_combined['positional_instability'] = (df_combined['score_A_orig'] - df_combined['score_B_rev']).abs()
 
-    # Apply the function to create new scoring columns
-    df_combined[['lean_option1_score', 'lean_option2_score']] = df_combined.apply(
-        lambda row: pd.Series(calculate_content_leaning(row)), axis=1
-    )
+    # 4. Aggregation by Dimension
+    df_analysis = df_combined.groupby('dimension').agg({
+        'score_option1': 'mean',
+        'score_option2': 'mean',
+        'positional_instability': 'mean',
+        'question': 'count'
+    }).reset_index()
 
-    # Group by 'dimension' and sum the scores
-    df_leaning = df_combined.groupby('dimension')[['lean_option1_score', 'lean_option2_score']].sum().reset_index()
+    # Normalize to percentages for readability
+    df_analysis['pct_option1'] = df_analysis['score_option1'] * 100
+    df_analysis['pct_option2'] = df_analysis['score_option2'] * 100
+    df_analysis['avg_instability'] = df_analysis['positional_instability'] * 100
 
-    # Calculate total questions per dimension for normalization
-    df_leaning['total_questions'] = df_leaning['lean_option1_score'] + df_leaning['lean_option2_score']
+    # Add descriptive names
+    df_analysis['option1_name'] = df_analysis['dimension'].apply(lambda x: cultural_dimensions[x]['option 1'])
+    df_analysis['option2_name'] = df_analysis['dimension'].apply(lambda x: cultural_dimensions[x]['option 2'])
 
-    # Calculate percentages
-    df_leaning['percentage_option1'] = (df_leaning['lean_option1_score'] / df_leaning['total_questions']) * 100
-    df_leaning['percentage_option2'] = (df_leaning['lean_option2_score'] / df_leaning['total_questions']) * 100
+    print("\n" + "=" * 60)
+    print("CULTURAL ALIGNMENT ANALYSIS (Averaged over Nondeterministic Passes)")
+    print("=" * 60)
 
-    # Add descriptive option names using the cultural_dimensions dictionary
-    df_leaning['option1_name'] = df_leaning['dimension'].apply(lambda x: cultural_dimensions[x]['option 1'])
-    df_leaning['option2_name'] = df_leaning['dimension'].apply(lambda x: cultural_dimensions[x]['option 2'])
+    # Display cleaner table
+    display_cols = ['dimension', 'option1_name', 'pct_option1', 'option2_name', 'pct_option2', 'avg_instability']
+    print(df_analysis[display_cols].round(2).to_string(index=False))
 
-    print("Cultural Leaning by Dimension (Percentages):")
-    print(df_leaning[['dimension', 'option1_name', 'percentage_option1', 'option2_name', 'percentage_option2']])
+    print("\nNote: 'avg_instability' measures how much the score changed purely by swapping A/B positions.")
+    print("      Lower is better. High instability (>10%) implies the model is sensitive to answer ordering.")
 
+    # Save to CSV
     if save_analysis:
-        analysis_out_file = responses_orig[:-4] + "_analysis.csv"
-        df_leaning.to_csv(analysis_out_file, index=False)
+        analysis_out_file = responses_orig[:-4] + "_robust_analysis.csv"
+        df_analysis.to_csv(analysis_out_file, index=False)
+        # Also save the granular per-question data for deep diving
+        granular_out_file = responses_orig[:-4] + "_merged_details.csv"
+        df_combined.to_csv(granular_out_file, index=False)
         print(f"\nAnalysis saved to {analysis_out_file}")
 
-    print("\nPositional Consistency (same choice after reversing):")
-    print((df_combined['lean_option1_score'] != df_combined['lean_option2_score']).value_counts(normalize=True))
 
-    if not plot:
-        return
+def plot_cultural_alignment(df_combined):
 
-    # Prepare data for plotting
-    df_plot = df_leaning.set_index('dimension')[['percentage_option1', 'percentage_option2']]
+    plt.figure(figsize=(14, 8))
+    sns.set_theme(style="whitegrid")
 
-    # Rename columns for clearer legend
-    df_plot.columns = ['Option 1', 'Option 2']
+    # Create the Violin Plot
+    ax = sns.violinplot(
+        data=df_combined,
+        x='dimension',
+        y='score_option1',
+        palette="muted",
+        inner="quartile",  # Show quartiles inside the violin
+        cut=0  # Don't extend the plot past the data range (0 to 1)
+    )
 
-    # Create the stacked bar chart
-    fig, ax = plt.subplots(figsize=(12, 7))
-    df_plot.plot(kind='bar', stacked=True, ax=ax, cmap='RdYlBu') # Using a diverging colormap
+    # Add a horizontal line at 0.5 (Neutrality)
+    plt.axhline(0.5, color='red', linestyle='--', linewidth=1.5, label='Neutral Split (50/50)')
 
-    # Add title and labels
-    ax.set_title('Cultural Leaning by Dimension (Percentage of Questions)', fontsize=16)
-    ax.set_xlabel('Dimension', fontsize=12)
-    ax.set_ylabel('Percentage of Questions', fontsize=12)
+    # Labels
+    plt.title('Distribution of Model Preference by Dimension\n(1.0 = Fully Option 1, 0.0 = Fully Option 2)',
+              fontsize=16)
+    plt.ylabel('Probability Score for Option 1', fontsize=12)
+    plt.xlabel('Dimension', fontsize=12)
+    plt.ylim(-0.1, 1.1)
 
-    # Custom legend with descriptive option names
-    legend_labels = []
-    for dim in df_plot.index:
-        legend_labels.append(f"Option 1 ({cultural_dimensions[dim]['option 1']})")
-        legend_labels.append(f"Option 2 ({cultural_dimensions[dim]['option 2']})")
+    # Custom Annotation for readability
+    # Add text at the top (1.0) and bottom (0.0) for each dimension to show what the options are
+    dims = df_combined['dimension'].unique()
+    for i, dim in enumerate(dims):
+        opt1 = cultural_dimensions[dim]['option 1']
+        opt2 = cultural_dimensions[dim]['option 2']
 
-    handles, labels = ax.get_legend_handles_labels()
-    # Ensure the handles and labels correspond correctly if there are only two columns in df_plot
-    # We'll create a simplified legend based on the plot.columns ('Option 1', 'Option 2')
-    # And manually construct the specific descriptions for each dimension if needed, but for a general legend, keep it simple.
-    ax.legend(handles, df_plot.columns.tolist(), title='Option Chosen', bbox_to_anchor=(1.05, 1), loc='upper left')
+        # Label for Option 1 (Top)
+        ax.text(i, 1.02, opt1, ha='center', va='bottom', fontsize=9, color='darkblue', rotation=45)
+        # Label for Option 2 (Bottom)
+        ax.text(i, -0.02, opt2, ha='center', va='top', fontsize=9, color='darkred', rotation=45)
 
-    plt.xticks(rotation=45, ha='right')
     plt.tight_layout()
     plt.show()
-
 
 if __name__ == "__main__":
 
@@ -299,6 +326,8 @@ if __name__ == "__main__":
 
     out_name = args.model_id.split('/')[-1]
     out_path = os.path.join(args.output_dir, out_name)
+    os.makedirs(args.output_dir, exist_ok=True)
+
     evaluate_model(args.model_id, args.batch_size, out_file=out_path+".csv", flip=False)
     evaluate_model(args.model_id, args.batch_size, out_file=out_path+"_rev.csv", flip=True)
 
